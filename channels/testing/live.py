@@ -1,3 +1,8 @@
+import asyncio
+import sys
+import threading
+import queue
+
 from django.conf import settings
 from django.db import connections
 from django.test.testcases import LiveServerTestCase, LiveServerThread
@@ -17,6 +22,15 @@ class DaphneLiveServerThread(LiveServerThread):
         super().__init__(*args, **kwargs)
         self.application = self.get_application()
         DaphneLiveServerThread.singleton = self
+
+        # _pause is set by main thread to ask thread to pause
+        self._pause = threading.Event()
+        # _paused is set by thread to tell main thread it's done pausing
+        self._paused = threading.Event()
+        # _resume is set by main thread to ask thread to resume
+        self._resume = threading.Event()
+        # _resumed is set by thread to tell main thread it's done resuming
+        self._resumed = threading.Event()
 
     def run(self):
         """
@@ -38,6 +52,22 @@ class DaphneLiveServerThread(LiveServerThread):
             connections.close_all()
 
     def _create_server(self):
+        """Create a daphne server with local thread asyncio event loop and twisted reactor"""
+        # Reset reactor to use local thread's event loop
+        from twisted.internet import asyncioreactor
+        del sys.modules["twisted.internet.reactor"]
+
+        try:
+            event_loop = asyncio.get_event_loop()
+        except RuntimeError:
+            event_loop = asyncio.new_event_loop()
+
+        asyncioreactor.install(event_loop)
+        from twisted.internet import reactor
+
+        # Create hook to check if main thread communicated with us
+        reactor.callLater(1, self._on_reactor_hook, reactor)
+
         application = self.application
         if self.static_handler:
             application = self.static_handler(application)
@@ -55,7 +85,20 @@ class DaphneLiveServerThread(LiveServerThread):
             signal_handlers=False,
             root_path=getattr(settings, "FORCE_SCRIPT_NAME", "") or "",
             ready_callable=ready,
+            reactor=reactor,
         )
+
+    def _on_reactor_hook(self, reactor):
+        """Check for events from main thread, while within this thread"""
+        if self._pause.is_set():
+            self.do_pause()
+            self._paused.set() # Notify main thread we cleared ok
+            self._pause.clear() # Reset to allow pausing again
+        if self._resume.is_set():
+            self.do_resume()
+            self._resumed.set() # Notify main thread we resumed ok
+            self._resume.clear() # Reset to allow resuming again
+        reactor.callLater(1, self._on_reactor_hook, reactor)
 
     def get_application(self):
         application = get_default_application()
@@ -64,20 +107,33 @@ class DaphneLiveServerThread(LiveServerThread):
 
         return application
 
-    def pause(self):
-        """Pause daphne"""
+    def do_pause(self):
+        """Pause daphne from thread"""
         self.application = None
         self.daphne.clear()
 
-    def unpause(self, connections_override):
-        """Unpause daphne, with new connections_override"""
-        # TODO: override these connections in the actual thread. This function runs in the main thread.
-        for alias, conn in connections_override.items():
+    def do_resume(self):
+        """Resume daphne from thread"""
+        # Override this thread's database connections with the ones
+        # provided by the main thread.
+        for alias, conn in self.connections_override.items():
             connections[alias] = conn
         self.application = self.get_application()
         self.daphne.set_application(self.application)
 
+    def pause(self):
+        """Pause daphne, from main thread"""
+        self._pause.set() # Request thread to pause
+        self._paused.wait() # Wait until thread has paused
+
+    def resume(self, connections_override):
+        """Resume daphne, with new connections_override, from main thread"""
+        self.connections_override = connections_override
+        self._resume.set() # Request thread to resume
+        self._resumed.wait() # Wait until thread has resumed
+
     def terminate(self):
+        """Stop thread, from main thread"""
         if hasattr(self, 'daphne'):
            # Stop the ASGI server
            self.daphne.stop()
@@ -112,7 +168,7 @@ class ChannelsLiveServerTestCase(LiveServerTestCase):
         cls._live_server_modified_settings.enable()
         if hasattr(cls.server_thread_class, 'singleton') and cls.server_thread_class.singleton:
             cls.server_thread = cls.server_thread_class.singleton
-            cls.server_thread.unpause(connections_override)
+            cls.server_thread.resume(connections_override)
         else:
             cls.server_thread = cls._create_server_thread(connections_override)
             cls.server_thread.daemon = True
